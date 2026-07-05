@@ -108,13 +108,11 @@ class TestRInSentinel(TestCase):
         import grass.script as gs
 
         out = gs.read_command(
-            "t.rast.list", input=strds_name, columns="name", flags="u"
+            "t.rast.list", input=strds_name, columns="name"
         ).strip()
-        return [
-            line.split("|")[0].strip()
-            for line in out.splitlines()
-            if "|" in line
-        ]
+        lines = out.splitlines()
+        # First line is the header ("name"); skip it
+        return [line.strip() for line in lines[1:] if line.strip()]
 
     # ------------------------------------------------------------------
     # Basic download + import
@@ -311,9 +309,9 @@ class TestRInSentinel(TestCase):
             "t.rast.list",
             input=strds_name,
             columns="name,start_time",
-            flags="u",
         ).strip()
-        rows = [line for line in out.splitlines() if "|" in line]
+        lines = out.splitlines()
+        rows = [line for line in lines[1:] if "|" in line]  # skip header
         self.assertGreater(len(rows), 0, "No maps found in STRDS")
         for row in rows:
             parts = row.split("|")
