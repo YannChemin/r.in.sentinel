@@ -110,6 +110,11 @@
 # %end
 
 # %flag
+# % key: m
+# % description: Apply cloud masking using i.sentinel.mask (requires B02,B03,B04,B08,B8A,B11,B12; auto-added)
+# %end
+
+# %flag
 # % key: j
 # % description: Write per-band metadata JSON to $MAPSET/cell_misc/<map>/description.json
 # %end
@@ -128,9 +133,18 @@
 # % guisection: Output
 # %end
 
+# %option
+# % key: strds
+# % type: string
+# % required: no
+# % multiple: no
+# % description: Prefix for Space-Time Raster Dataset names (one STRDS per band, e.g. strds=s2 → s2_B04, s2_B08 …)
+# % guisection: Output
+# %end
+
 # %rules
 # % exclusive: -g, stac
-# % exclusive: -c, -s
+# % exclusive: -c, -s, -m
 # % exclusive: -j, metadata
 # %end
 
@@ -140,6 +154,80 @@ import sys
 import tempfile
 
 import grass.script as gs
+
+# Bands required by i.sentinel.mask (mapped to Sentinel-2 band names)
+SENTINEL_MASK_BANDS = {
+    "blue": "B02",
+    "green": "B03",
+    "red": "B04",
+    "nir": "B08",
+    "nir8a": "B8A",
+    "swir11": "B11",
+    "swir12": "B12",
+}
+
+
+def fetch_stac_sun_angles(stac_url, collection, lat, lon, start, end, clouds=None):
+    """Return per-date mean solar zenith and azimuth from a STAC metadata search.
+
+    Does not download any imagery — reads item properties only.
+
+    Returns
+    -------
+    dict
+        {date_str: (mean_solar_zenith, mean_solar_azimuth)} for each date
+        that has the required properties.  Dates without sun-angle metadata
+        are silently omitted.
+    """
+    try:
+        import pystac_client
+    except ImportError:
+        gs.warning(
+            "pystac_client not available; sun angles cannot be fetched from STAC. "
+            "i.sentinel.mask will be skipped."
+        )
+        return {}
+
+    try:
+        import planetary_computer as pc
+        sign = pc.sign_inplace
+    except ImportError:
+        sign = None
+
+    try:
+        client = pystac_client.Client.open(
+            stac_url,
+            modifier=sign,
+        )
+        search_kwargs = dict(
+            collections=[collection],
+            datetime=f"{start}/{end}",
+            intersects={"type": "Point", "coordinates": [lon, lat]},
+        )
+        if clouds is not None:
+            search_kwargs["query"] = {"eo:cloud_cover": {"lt": clouds}}
+        search = client.search(**search_kwargs)
+        items = list(search.items())
+    except Exception as e:
+        gs.warning(f"STAC sun-angle search failed: {e}")
+        return {}
+
+    sun_angles = {}
+    for item in items:
+        date_str = item.datetime.strftime("%Y%m%d") if item.datetime else None
+        if date_str is None or date_str in sun_angles:
+            continue
+        props = item.properties
+        zenith = props.get("s2:mean_solar_zenith") or props.get(
+            "view:sun_elevation"
+        )
+        azimuth = props.get("s2:mean_solar_azimuth") or props.get(
+            "view:sun_azimuth"
+        )
+        if zenith is not None and azimuth is not None:
+            sun_angles[date_str] = (float(zenith), float(azimuth))
+
+    return sun_angles
 
 
 def get_region_center_latlon():
@@ -494,11 +582,14 @@ def main():
     use_gee = flags["g"]
     do_scl_mask = flags["c"]
     do_spectral_mask = flags["s"]
+    do_sentinel_mask = flags["m"]
     list_only = flags["l"]
     print_region = flags["p"]
     write_json = flags["j"]
     metadata_dir = options["metadata"] if options["metadata"] else None
-    do_metadata = write_json or (metadata_dir is not None)
+    # -m always writes description.json so i.sentinel.mask can read sun angles
+    do_metadata = write_json or do_sentinel_mask or (metadata_dir is not None)
+    strds_prefix = options["strds"] if options["strds"] else None
 
     clouds = int(clouds_raw) if clouds_raw else None
 
@@ -517,6 +608,18 @@ def main():
     if do_scl_mask and "SCL" not in bands:
         gs.message("Adding SCL band to download list for cloud masking.")
         bands.append("SCL")
+
+    # Ensure all i.sentinel.mask bands are present when -m is requested
+    if do_sentinel_mask:
+        added = []
+        for s2_band in SENTINEL_MASK_BANDS.values():
+            if s2_band not in bands:
+                bands.append(s2_band)
+                added.append(s2_band)
+        if added:
+            gs.message(
+                f"Adding bands required by i.sentinel.mask: {', '.join(added)}"
+            )
 
     # --- Get region centre and size ---
     gs.message("Determining region centre and extent…")
@@ -626,9 +729,24 @@ def main():
 
     gs.message(f"Unique acquisition dates: {', '.join(unique_dates)}")
 
+    # --- Fetch sun angles from STAC for i.sentinel.mask ---
+    sun_angles = {}
+    if do_sentinel_mask and not use_gee:
+        gs.message("Fetching solar angles from STAC metadata…")
+        sun_angles = fetch_stac_sun_angles(
+            stac_url, collection, lat, lon, start, end, clouds
+        )
+        if not sun_angles:
+            gs.warning(
+                "No solar angles found in STAC metadata; "
+                "i.sentinel.mask will be skipped for all dates."
+            )
+
     # --- Import each date/band ---
     imported_maps_total = 0
     groups_created = []
+    # Track imported maps per band for STRDS registration: {band_name: [map_name, ...]}
+    band_map_registry = {str(b): [] for b in da.coords["band"].values}
 
     for date_str in unique_dates:
         indices = [i for i, d in enumerate(date_strs) if d == date_str]
@@ -659,6 +777,7 @@ def main():
             try:
                 import_band_to_grass(arr_2d, map_name, crs_str, transform)
                 band_maps.append(map_name)
+                band_map_registry[band_name].append(map_name)
                 imported_maps_total += 1
 
                 # Set acquisition timestamp on the raster map
@@ -696,13 +815,87 @@ def main():
                         "cloud_cover_max": clouds,
                         "scl_masked": do_scl_mask,
                         "spectral_masked": do_spectral_mask,
+                        "sentinel_masked": do_sentinel_mask,
                         "n_tiles_mosaicked": len(indices),
                         "central_lat": lat,
                         "central_lon": lon,
                     }
+                    # Add sun angles so i.sentinel.mask can read them via metadata=default
+                    if date_str in sun_angles:
+                        zenith, azimuth = sun_angles[date_str]
+                        meta["MEAN_SUN_ZENITH_ANGLE"] = zenith
+                        meta["MEAN_SUN_AZIMUTH_ANGLE"] = azimuth
                     write_band_metadata(map_name, meta, metadata_dir)
             except Exception as e:
                 gs.warning(f"Failed to import {map_name}: {e}")
+
+        # --- i.sentinel.mask cloud masking ---
+        if do_sentinel_mask and band_maps:
+            # Check all 7 required bands were actually imported for this date
+            mask_band_maps = {
+                role: f"{output_prefix}_{date_str}_{s2b}"
+                for role, s2b in SENTINEL_MASK_BANDS.items()
+            }
+            missing = [
+                role
+                for role, m in mask_band_maps.items()
+                if m not in band_maps
+            ]
+            if missing:
+                gs.warning(
+                    f"{date_str}: skipping i.sentinel.mask — "
+                    f"missing band(s): {', '.join(missing)}"
+                )
+            elif date_str not in sun_angles:
+                gs.warning(
+                    f"{date_str}: skipping i.sentinel.mask — "
+                    "no solar angles available for this date"
+                )
+            else:
+                cloud_raster = f"{output_prefix}_{date_str}_cloud_mask"
+                try:
+                    gs.run_command(
+                        "i.sentinel.mask",
+                        flags="sc",  # -s rescale DN→reflectance, -c cloud-only
+                        scale_fac=10000,
+                        cloud_raster=cloud_raster,
+                        overwrite=True,
+                        quiet=True,
+                        **mask_band_maps,
+                    )
+                    gs.verbose(f"  {date_str}: cloud mask created → {cloud_raster}")
+
+                    # Null out cloudy pixels in all imported bands
+                    nulled = 0
+                    for bmap in band_maps:
+                        gs.mapcalc(
+                            f"{bmap} = if(isnull({cloud_raster}), {bmap}, null())",
+                            overwrite=True,
+                            quiet=True,
+                        )
+                        nulled += 1
+                    gs.message(
+                        f"{date_str}: i.sentinel.mask applied to {nulled} band(s)."
+                    )
+
+                    # Include cloud mask raster in the date group
+                    band_maps.append(cloud_raster)
+                    band_map_registry.setdefault("cloud_mask", []).append(
+                        cloud_raster
+                    )
+                    imported_maps_total += 1
+
+                    # Set timestamp on the cloud mask map too
+                    gs.run_command(
+                        "r.timestamp",
+                        map=cloud_raster,
+                        date=timestamp_str,
+                        quiet=True,
+                    )
+                except Exception as e:
+                    gs.warning(
+                        f"{date_str}: i.sentinel.mask failed: {e}"
+                    )
 
         if band_maps:
             group_name = f"{output_prefix}_{date_str}"
@@ -725,6 +918,55 @@ def main():
         f"Done. Imported {imported_maps_total} raster map(s) "
         f"across {len(groups_created)} scene group(s)."
     )
+
+    # --- STRDS registration ---
+    if strds_prefix and imported_maps_total > 0:
+        gs.message("Creating Space-Time Raster Datasets…")
+        strds_created = []
+        for band_name, map_list in band_map_registry.items():
+            if not map_list:
+                continue
+            strds_name = f"{strds_prefix}_{band_name}"
+            try:
+                gs.run_command(
+                    "t.create",
+                    type="strds",
+                    temporaltype="absolute",
+                    output=strds_name,
+                    title=f"Sentinel-2 {collection} — band {band_name}",
+                    description=(
+                        f"Imported by r.in.sentinel from {collection}, "
+                        f"{start} to {end}, band {band_name}"
+                    ),
+                    overwrite=True,
+                    quiet=True,
+                )
+                # -i: use timestamps already stored on each map via r.timestamp
+                gs.run_command(
+                    "t.register",
+                    flags="i",
+                    type="raster",
+                    input=strds_name,
+                    maps=",".join(map_list),
+                    overwrite=True,
+                    quiet=True,
+                )
+                strds_created.append(strds_name)
+                gs.message(
+                    f"  STRDS '{strds_name}': {len(map_list)} map(s) registered."
+                )
+            except Exception as e:
+                gs.warning(f"Failed to create/register STRDS '{strds_name}': {e}")
+
+        if strds_created:
+            gs.message(
+                f"Created {len(strds_created)} STRDS: {', '.join(strds_created)}"
+            )
+            gs.message(
+                "Tip: apply cloud masking per scene with i.sentinel.mask, "
+                "then re-register the masked maps."
+            )
+
     return 0
 
 

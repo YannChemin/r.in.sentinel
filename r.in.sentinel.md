@@ -101,6 +101,52 @@ Each JSON file records:
 | `n_tiles_mosaicked` | Number of overlapping tiles merged |
 | `central_lat` / `central_lon` | Region centre in WGS84 |
 
+### Space-Time Raster Dataset (STRDS)
+
+When the **strds** option is set, the module creates one STRDS per downloaded
+band and registers all imported maps into it after the import loop. The STRDS
+names follow the pattern `{strds}_{band}`, e.g. `s2_B04`, `s2_B08`, `s2_SCL`.
+
+Temporal registration uses the acquisition timestamp already embedded in each
+raster map by `r.timestamp` (format `DD Mon YYYY HH:MM:SS.ffffff`), so no
+additional timestamp file is required. The `-i` flag of `t.register` reads
+these stored timestamps automatically.
+
+This makes the imported data immediately usable with TGRASS tools such as
+`t.rast.series`, `t.rast.algebra`, and `t.rast.list`.
+
+#### Cloud masking with i.sentinel.mask (`-m` flag)
+
+The **-m** flag invokes *i.sentinel.mask* automatically for each acquired
+date. The following bands are required by *i.sentinel.mask* and are added
+to the download list automatically if not already requested:
+
+| Role | Band |
+| ---- | ---- |
+| blue | B02 |
+| green | B03 |
+| red | B04 |
+| nir | B08 |
+| nir8a | B8A |
+| swir11 | B11 |
+| swir12 | B12 |
+
+Solar zenith and azimuth angles needed by *i.sentinel.mask* are fetched
+automatically from the STAC item properties (`s2:mean_solar_zenith`,
+`s2:mean_solar_azimuth`) and written to `cell_misc/<map>/description.json`
+for each imported band. *i.sentinel.mask* is then called with the `-s`
+(rescale from DN to reflectance) and `-c` (cloud-only, no shadow) flags.
+
+After masking, cloudy pixels are set to NULL in every imported band for
+that date using `r.mapcalc`. The resulting cloud mask raster
+(`{output}_{YYYYMMDD}_cloud_mask`) is kept, included in the *i.group*
+group, given a timestamp via `r.timestamp`, and registered in the STRDS
+if the **strds** option is set.
+
+If solar angle metadata is unavailable for a given date (GEE backend,
+or STAC item without sun-angle properties), masking is skipped for that
+date with a warning.
+
 ### Listing scenes
 
 With the **-l** flag the module prints one date per line to stdout and
@@ -189,6 +235,30 @@ r.in.sentinel collection=sentinel-2-l2a \
     bands=B04,B08 start=2023-06-01 end=2023-06-30 output=s2_aws
 ```
 
+### Download with i.sentinel.mask cloud masking (auto-adds required bands)
+
+```sh
+g.region n=47.73 s=47.68 e=-2.85 w=-2.93
+r.in.sentinel collection=sentinel-2-l2a \
+    bands=B02,B04,B08 \
+    start=2023-07-01 end=2023-07-31 clouds=30 \
+    output=s2 flags=m
+# B03, B8A, B11, B12 are added automatically; cloud_mask maps are created
+# per date and cloudy pixels are nulled in all bands.
+```
+
+### Import directly into a Space-Time Raster Dataset
+
+```sh
+g.region n=47.73 s=47.68 e=-2.85 w=-2.93
+r.in.sentinel collection=sentinel-2-l2a \
+    bands=B02,B03,B04,B08,B8A,B11,B12,SCL \
+    start=2023-07-01 end=2023-07-31 clouds=20 \
+    output=s2 strds=s2_ts flags=c
+# Result: STRDS s2_ts_B02, s2_ts_B04, …, s2_ts_SCL
+t.rast.list input=s2_ts_B04
+```
+
 ### Download with metadata JSON written to the standard GRASS location
 
 ```sh
@@ -209,7 +279,10 @@ r.in.sentinel collection=COPERNICUS/S2_SR_HARMONIZED \
 ## SEE ALSO
 
 *[i.group](i.group.md), [r.import](r.import.md),
-[r.in.gdal](r.in.gdal.md), [g.region](g.region.md)*
+[r.in.gdal](r.in.gdal.md), [g.region](g.region.md),
+[i.sentinel.mask](i.sentinel.mask.md),
+[t.create](t.create.md), [t.register](t.register.md),
+[t.rast.series](t.rast.series.md), [t.rast.algebra](t.rast.algebra.md)*
 
 ## REFERENCES
 
