@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # %Module
 # % description: Downloads and imports Sentinel-2 imagery using the cubo library via Microsoft Planetary Computer or Google Earth Engine.
+# % keyword: Import
 # % keyword: imagery
 # % keyword: satellite
 # % keyword: Sentinel
-# % keyword: import
 # % keyword: download
 # % keyword: STAC
 # % keyword: Planetary Computer
 # % keyword: cloud
+# % keyword: metadata
 # %end
 
 # %option
@@ -109,15 +110,31 @@
 # %end
 
 # %flag
+# % key: j
+# % description: Write per-band metadata JSON to $MAPSET/cell_misc/<map>/description.json
+# %end
+
+# %flag
 # % key: p
 # % description: Print region info and exit
+# %end
+
+# %option
+# % key: metadata
+# % type: string
+# % required: no
+# % multiple: no
+# % description: Directory in which per-band metadata JSON files are saved (alternative to -j)
+# % guisection: Output
 # %end
 
 # %rules
 # % exclusive: -g, stac
 # % exclusive: -c, -s
+# % exclusive: -j, metadata
 # %end
 
+import json
 import os
 import sys
 import tempfile
@@ -416,6 +433,42 @@ def import_band_to_grass(band_array_2d, map_name, crs_str, transform):
             os.remove(tmp_path)
 
 
+def sentinel2_semantic_label(band_name):
+    """Return the GRASS semantic label for a Sentinel-2 band name.
+
+    E.g. 'B02' -> 'S2_2', 'B8A' -> 'S2_8A', 'SCL' -> 'S2_SCL'.
+    Returns None for unrecognised names.
+    """
+    b = band_name.upper()
+    if b == "SCL":
+        return "S2_SCL"
+    if b.startswith("B"):
+        suffix = b[1:].lstrip("0") or "0"
+        return f"S2_{suffix}"
+    return None
+
+
+def write_band_metadata(map_name, metadata_dict, metadata_dir=None):
+    """Write per-band metadata as description.json.
+
+    Follows the convention of i.sentinel.import: one JSON file per raster map
+    written to $MAPSET/cell_misc/<map_name>/description.json when metadata_dir
+    is None, or to <metadata_dir>/<map_name>/description.json otherwise.
+    """
+    if metadata_dir is None:
+        env = gs.gisenv()
+        cell_misc = os.path.join(
+            env["GISDBASE"], env["LOCATION_NAME"], env["MAPSET"], "cell_misc"
+        )
+        json_path = os.path.join(cell_misc, map_name, "description.json")
+    else:
+        json_path = os.path.join(metadata_dir, map_name, "description.json")
+
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w") as fh:
+        json.dump(metadata_dict, fh, indent=2)
+
+
 def main():
     """Main function."""
     try:
@@ -443,6 +496,9 @@ def main():
     do_spectral_mask = flags["s"]
     list_only = flags["l"]
     print_region = flags["p"]
+    write_json = flags["j"]
+    metadata_dir = options["metadata"] if options["metadata"] else None
+    do_metadata = write_json or (metadata_dir is not None)
 
     clouds = int(clouds_raw) if clouds_raw else None
 
@@ -577,6 +633,10 @@ def main():
     for date_str in unique_dates:
         indices = [i for i, d in enumerate(date_strs) if d == date_str]
 
+        # Use the timestamp of the first tile for r.timestamp
+        acq_time = times_pd[indices[0]]
+        timestamp_str = acq_time.strftime("%d %b %Y %H:%M:%S.%f")
+
         # Mosaic overlapping tiles: mean of valid pixels across tiles
         if len(indices) == 1:
             da_day = da.isel(time=indices[0])  # dims: (band, y, x)
@@ -600,6 +660,47 @@ def main():
                 import_band_to_grass(arr_2d, map_name, crs_str, transform)
                 band_maps.append(map_name)
                 imported_maps_total += 1
+
+                # Set acquisition timestamp on the raster map
+                gs.run_command(
+                    "r.timestamp", map=map_name, date=timestamp_str, quiet=True
+                )
+
+                # Set source and history metadata; add semantic label when known
+                support_args = {
+                    "map": map_name,
+                    "source1": "GEE" if use_gee else stac_url,
+                    "source2": collection,
+                    "history": (
+                        f"band={band_name} date={date_str} "
+                        f"epsg={epsg} resolution={resolution}m "
+                        f"n_tiles={len(indices)}"
+                    ),
+                }
+                sem_label = sentinel2_semantic_label(band_name)
+                if sem_label:
+                    support_args["semantic_label"] = sem_label
+                gs.run_command("r.support", quiet=True, **support_args)
+
+                if do_metadata:
+                    meta = {
+                        "collection": collection,
+                        "band": band_name,
+                        "date": date_str,
+                        "start_date": start,
+                        "end_date": end,
+                        "epsg": int(epsg),
+                        "resolution_m": resolution,
+                        "stac_endpoint": None if use_gee else stac_url,
+                        "gee": use_gee,
+                        "cloud_cover_max": clouds,
+                        "scl_masked": do_scl_mask,
+                        "spectral_masked": do_spectral_mask,
+                        "n_tiles_mosaicked": len(indices),
+                        "central_lat": lat,
+                        "central_lon": lon,
+                    }
+                    write_band_metadata(map_name, meta, metadata_dir)
             except Exception as e:
                 gs.warning(f"Failed to import {map_name}: {e}")
 

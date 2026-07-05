@@ -74,6 +74,33 @@ the NS or EW region extent. After download, each band slice is imported
 with *r.import* using `extent=region`, which reprojects and clips to
 the current computational region automatically.
 
+### Per-band metadata JSON
+
+With the **-j** flag the module writes a `description.json` file for
+each imported raster map to the standard GRASS location
+`$MAPSET/cell_misc/<map_name>/description.json`. Alternatively, the
+**metadata** option allows specifying a directory where the files are
+saved (`<metadata_dir>/<map_name>/description.json`). The two options
+are mutually exclusive.
+
+Each JSON file records:
+
+| Key | Description |
+| --- | ----------- |
+| `collection` | STAC collection name |
+| `band` | Band identifier (e.g. `B04`) |
+| `date` | Acquisition date (`YYYYMMDD`) |
+| `start_date` / `end_date` | Query date range |
+| `epsg` | EPSG code of the downloaded data |
+| `resolution_m` | Spatial resolution in metres |
+| `stac_endpoint` | STAC endpoint URL (null for GEE) |
+| `gee` | `true` when downloaded from Google Earth Engine |
+| `cloud_cover_max` | Maximum cloud cover filter applied |
+| `scl_masked` | Whether SCL cloud masking was applied |
+| `spectral_masked` | Whether spectral CSI masking was applied |
+| `n_tiles_mosaicked` | Number of overlapping tiles merged |
+| `central_lat` / `central_lon` | Region centre in WGS84 |
+
 ### Listing scenes
 
 With the **-l** flag the module prints one date per line to stdout and
@@ -160,6 +187,14 @@ r.in.sentinel collection=sentinel-2-l1c \
 r.in.sentinel collection=sentinel-2-l2a \
     stac=https://earth-search.aws.element84.com/v1 \
     bands=B04,B08 start=2023-06-01 end=2023-06-30 output=s2_aws
+```
+
+### Download with metadata JSON written to the standard GRASS location
+
+```sh
+r.in.sentinel collection=sentinel-2-l2a bands=B02,B03,B04,B08,SCL \
+    start=2023-07-01 end=2023-07-31 clouds=20 \
+    output=s2_plumergat flags=j
 ```
 
 ### Use Google Earth Engine backend
