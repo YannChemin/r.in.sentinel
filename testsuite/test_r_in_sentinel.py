@@ -152,7 +152,18 @@ class TestRInSentinel(TestCase):
         """r.timestamp is set on every imported raster."""
         import grass.script as gs
 
-        rasters = self._rasters_for_prefix(self.output_prefix)
+        prefix = self.output_prefix + "_ts_check"
+        self.assertModule(
+            "r.in.sentinel",
+            collection="sentinel-2-l2a",
+            bands="B04",
+            start="2023-07-01",
+            end="2023-07-10",
+            clouds=30,
+            output=prefix,
+            overwrite=True,
+        )
+        rasters = self._rasters_for_prefix(prefix)
         self.assertGreater(len(rasters), 0, "No rasters to check timestamps on")
         for rmap in rasters:
             ts = gs.read_command("r.timestamp", map=rmap).strip()
@@ -163,16 +174,21 @@ class TestRInSentinel(TestCase):
         """Semantic labels (e.g. S2_4) are set on each imported band."""
         import grass.script as gs
 
-        rasters = self._rasters_for_prefix(self.output_prefix)
-        self.assertGreater(len(rasters), 0)
+        prefix = self.output_prefix + "_sl_check"
+        self.assertModule(
+            "r.in.sentinel",
+            collection="sentinel-2-l2a",
+            bands="B04,B08,SCL",
+            start="2023-07-01",
+            end="2023-07-10",
+            clouds=30,
+            output=prefix,
+            overwrite=True,
+        )
+        rasters = self._rasters_for_prefix(prefix)
+        self.assertGreater(len(rasters), 0, "No rasters imported for semantic label test")
         for rmap in rasters:
             info = gs.raster_info(rmap)
-            # SCL → S2_SCL; B04 → S2_4; B02 → S2_2
-            self.assertIn(
-                "semantic_label",
-                info,
-                f"semantic_label key missing from r.info for {rmap}",
-            )
             label = info.get("semantic_label", "")
             self.assertTrue(
                 label.startswith("S2_"),
