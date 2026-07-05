@@ -946,10 +946,9 @@ def main():
                     overwrite=True,
                     quiet=True,
                 )
-                # -i: use timestamps already stored on each map via r.timestamp
+                # reads r.timestamp stored on each map automatically (no flag needed)
                 gs.run_command(
                     "t.register",
-                    flags="i",
                     type="raster",
                     input=strds_name,
                     maps=",".join(map_list),
