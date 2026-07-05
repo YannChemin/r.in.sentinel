@@ -130,7 +130,6 @@ class TestRInSentinel(TestCase):
             end="2023-07-31",
             clouds=30,
             output=self.output_prefix,
-            overwrite=True,
         )
         rasters = self._rasters_for_prefix(self.output_prefix)
         self.assertGreater(len(rasters), 0, "No rasters were imported")
@@ -161,7 +160,6 @@ class TestRInSentinel(TestCase):
             end="2023-07-10",
             clouds=30,
             output=prefix,
-            overwrite=True,
         )
         rasters = self._rasters_for_prefix(prefix)
         self.assertGreater(len(rasters), 0, "No rasters to check timestamps on")
@@ -183,7 +181,6 @@ class TestRInSentinel(TestCase):
             end="2023-07-10",
             clouds=30,
             output=prefix,
-            overwrite=True,
         )
         rasters = self._rasters_for_prefix(prefix)
         self.assertGreater(len(rasters), 0, "No rasters imported for semantic label test")
@@ -213,7 +210,6 @@ class TestRInSentinel(TestCase):
             clouds=30,
             output=prefix,
             flags="cj",
-            overwrite=True,
         )
         env = gs.gisenv()
         cell_misc = (
@@ -261,7 +257,6 @@ class TestRInSentinel(TestCase):
             clouds=30,
             output=prefix,
             strds=strds_prefix,
-            overwrite=True,
         )
 
         tgis.init()
@@ -308,7 +303,6 @@ class TestRInSentinel(TestCase):
             clouds=30,
             output=prefix,
             strds=strds_prefix,
-            overwrite=True,
         )
 
         tgis.init()
@@ -351,7 +345,6 @@ class TestRInSentinel(TestCase):
             output=prefix,
             strds=strds_prefix,
             flags="c",
-            overwrite=True,
         )
 
         tgis.init()
@@ -378,7 +371,6 @@ class TestRInSentinel(TestCase):
             end="2023-07-10",
             clouds=60,
             output=prefix_raw,
-            overwrite=True,
         )
         self.assertModule(
             "r.in.sentinel",
@@ -389,7 +381,6 @@ class TestRInSentinel(TestCase):
             clouds=60,
             output=prefix_masked,
             flags="c",
-            overwrite=True,
         )
 
         raw_maps = self._rasters_for_prefix(prefix_raw + "_")
@@ -427,7 +418,6 @@ class TestRInSentinel(TestCase):
             end="2023-09-15",
             output=prefix,
             flags="s",
-            overwrite=True,
         )
         rasters = self._rasters_for_prefix(prefix)
         self.assertGreater(len(rasters), 0, "No rasters with spectral masking")
