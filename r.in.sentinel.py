@@ -922,6 +922,11 @@ def main():
     # --- STRDS registration ---
     if strds_prefix and imported_maps_total > 0:
         gs.message("Creating Space-Time Raster Datasets…")
+        try:
+            import grass.temporal as tgis
+            tgis.init()
+        except Exception as e:
+            gs.warning(f"Failed to initialise temporal framework: {e}")
         strds_created = []
         for band_name, map_list in band_map_registry.items():
             if not map_list:
