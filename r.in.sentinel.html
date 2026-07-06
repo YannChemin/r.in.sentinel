@@ -1,0 +1,328 @@
+<h2>DESCRIPTION</h2>
+
+<em>r.in.sentinel</em> downloads Sentinel-2 imagery directly into the
+current GRASS GIS mapset using the
+<a href="https://github.com/ESDS-Leipzig/cubo">cubo</a> Python library.
+Data is fetched from <b>Microsoft Planetary Computer</b> (default, no
+credentials required) or <b>Google Earth Engine</b> (<b>-g</b> flag,
+credentials required). Each acquisition date is imported as individual
+raster maps and grouped with <em>i.group</em>.
+
+<p>
+The module reads the current computational region to determine the
+centre coordinates (latitude/longitude) and the approximate download
+extent. Both latlong and projected locations are supported.
+
+<h3>Output naming</h3>
+
+Raster maps are named <tt>{output}_{YYYYMMDD}_{band}</tt>, e.g.
+<tt>sentinel2_20230615_B04</tt>. One <em>i.group</em> group is created
+per acquisition date: <tt>{output}_{YYYYMMDD}</tt>.
+
+<h3>Backends</h3>
+
+<b>Microsoft Planetary Computer</b> (default)<br>
+Collection <tt>sentinel-2-l2a</tt> provides Sentinel-2 Level-2A surface
+reflectance. No account is required. The <b>stac</b> option allows
+pointing to any STAC-compliant endpoint.
+
+<p>
+<b>Google Earth Engine</b><br>
+Use the <b>-g</b> flag and set <b>collection</b> to the GEE asset ID,
+e.g. <tt>COPERNICUS/S2_SR_HARMONIZED</tt>. GEE credentials must be
+configured beforehand (<tt>earthengine authenticate</tt>).
+
+<h2>NOTES</h2>
+
+<h3>Cloud removal</h3>
+
+Two cloud removal methods are available and are mutually exclusive.
+
+<h4>SCL-based masking (<tt>-c</tt> flag)</h4>
+
+Recommended for Sentinel-2 L2A data. Uses the Scene Classification
+Layer (SCL band) to keep only pixels classified as:
+
+<table>
+<tr><th>SCL value</th><th>Class</th></tr>
+<tr><td>4</td><td>Vegetation</td></tr>
+<tr><td>5</td><td>Not vegetated</td></tr>
+<tr><td>6</td><td>Water</td></tr>
+<tr><td>11</td><td>Snow / Ice</td></tr>
+</table>
+
+All other classes (clouds, shadows, saturated pixels, no-data) are set
+to NULL. The SCL band is automatically added to the download list when
+<b>-c</b> is requested.
+
+<h4>Spectral Cloud Score Index (<tt>-s</tt> flag)</h4>
+
+Fallback method suitable for L1C data or when the SCL band is
+unavailable. Computes a Cloud Score Index (CSI) from the Blue, Red, and
+NIR bands:
+
+<div class="code"><pre>
+CSI = (B02 + B04) / (2 * B08 + eps)
+</pre></div>
+
+Pixels are flagged as cloud when <tt>CSI &gt; 0.35</tt> <b>and</b>
+<tt>B02 &gt; 0.175</tt> (scaled reflectance). Requires <b>B02</b>,
+<b>B04</b>, and at least one of <b>B08</b> or <b>B8A</b>.
+
+<h3>Region and resolution</h3>
+
+The computational region centre is projected to WGS84 to serve as the
+cubo cube centre. The download edge size is derived from the larger of
+the NS or EW region extent. After download, each band slice is
+imported with <em>r.import</em> using <tt>extent=region</tt>, which
+reprojects and clips to the current computational region
+automatically.
+
+<h3>Per-band metadata JSON</h3>
+
+With the <b>-j</b> flag the module writes a <tt>description.json</tt>
+file for each imported raster map to the standard GRASS location
+<tt>$MAPSET/cell_misc/&lt;map_name&gt;/description.json</tt>.
+Alternatively, the <b>metadata</b> option allows specifying a
+directory where the files are saved
+(<tt>&lt;metadata_dir&gt;/&lt;map_name&gt;/description.json</tt>). The
+two options are mutually exclusive.
+
+<p>
+Each JSON file records:
+
+<table>
+<tr><th>Key</th><th>Description</th></tr>
+<tr><td><tt>collection</tt></td><td>STAC collection name</td></tr>
+<tr><td><tt>band</tt></td><td>Band identifier (e.g. <tt>B04</tt>)</td></tr>
+<tr><td><tt>date</tt></td><td>Acquisition date (<tt>YYYYMMDD</tt>)</td></tr>
+<tr><td><tt>start_date</tt> / <tt>end_date</tt></td><td>Query date range</td></tr>
+<tr><td><tt>epsg</tt></td><td>EPSG code of the downloaded data</td></tr>
+<tr><td><tt>resolution_m</tt></td><td>Spatial resolution in metres</td></tr>
+<tr><td><tt>stac_endpoint</tt></td><td>STAC endpoint URL (null for GEE)</td></tr>
+<tr><td><tt>gee</tt></td><td><tt>true</tt> when downloaded from Google Earth Engine</td></tr>
+<tr><td><tt>cloud_cover_max</tt></td><td>Maximum cloud cover filter applied</td></tr>
+<tr><td><tt>scl_masked</tt></td><td>Whether SCL cloud masking was applied</td></tr>
+<tr><td><tt>spectral_masked</tt></td><td>Whether spectral CSI masking was applied</td></tr>
+<tr><td><tt>n_tiles_mosaicked</tt></td><td>Number of overlapping tiles merged</td></tr>
+<tr><td><tt>central_lat</tt> / <tt>central_lon</tt></td><td>Region centre in WGS84</td></tr>
+</table>
+
+<h3>Space-Time Raster Dataset (STRDS)</h3>
+
+When the <b>strds</b> option is set, the module creates one STRDS per
+downloaded band and registers all imported maps into it after the
+import loop. The STRDS names follow the pattern
+<tt>{strds}_{band}</tt>, e.g. <tt>s2_B04</tt>, <tt>s2_B08</tt>,
+<tt>s2_SCL</tt>.
+
+<p>
+Temporal registration uses the acquisition timestamp already embedded
+in each raster map by <tt>r.timestamp</tt> (format
+<tt>DD Mon YYYY HH:MM:SS.ffffff</tt>), so no additional timestamp file
+is required. The <tt>-i</tt> flag of <tt>t.register</tt> reads these
+stored timestamps automatically.
+
+<p>
+This makes the imported data immediately usable with TGRASS tools such
+as <tt>t.rast.series</tt>, <tt>t.rast.algebra</tt>, and
+<tt>t.rast.list</tt>.
+
+<h4>Cloud masking with i.sentinel.mask (<tt>-m</tt> flag)</h4>
+
+The <b>-m</b> flag invokes <em>i.sentinel.mask</em> automatically for
+each acquired date. The following bands are required by
+<em>i.sentinel.mask</em> and are added to the download list
+automatically if not already requested:
+
+<table>
+<tr><th>Role</th><th>Band</th></tr>
+<tr><td>blue</td><td>B02</td></tr>
+<tr><td>green</td><td>B03</td></tr>
+<tr><td>red</td><td>B04</td></tr>
+<tr><td>nir</td><td>B08</td></tr>
+<tr><td>nir8a</td><td>B8A</td></tr>
+<tr><td>swir11</td><td>B11</td></tr>
+<tr><td>swir12</td><td>B12</td></tr>
+</table>
+
+Solar zenith and azimuth angles needed by <em>i.sentinel.mask</em> are
+fetched automatically from the STAC item properties
+(<tt>s2:mean_solar_zenith</tt>, <tt>s2:mean_solar_azimuth</tt>) and
+written to <tt>cell_misc/&lt;map&gt;/description.json</tt> for each
+imported band. <em>i.sentinel.mask</em> is then called with the
+<tt>-s</tt> (rescale from DN to reflectance) and <tt>-c</tt>
+(cloud-only, no shadow) flags.
+
+<p>
+After masking, cloudy pixels are set to NULL in every imported band
+for that date using <tt>r.mapcalc</tt>. The resulting cloud mask
+raster (<tt>{output}_{YYYYMMDD}_cloud_mask</tt>) is kept, included in
+the <em>i.group</em> group, given a timestamp via <tt>r.timestamp</tt>,
+and registered in the STRDS if the <b>strds</b> option is set.
+
+<p>
+If solar angle metadata is unavailable for a given date (GEE backend,
+or STAC item without sun-angle properties), masking is skipped for
+that date with a warning.
+
+<h3>Listing scenes</h3>
+
+With the <b>-l</b> flag the module prints one date per line to stdout
+and exits without importing anything.
+
+<h2>REQUIREMENTS</h2>
+
+The following Python packages must be installed:
+
+<div class="code"><pre>
+pip install cubo rasterio rioxarray
+</pre></div>
+
+For GEE support:
+
+<div class="code"><pre>
+pip install earthengine-api
+earthengine authenticate
+</pre></div>
+
+<h3>PROJ version warning</h3>
+
+<b>PROJ &gt;= 7.0 is required</b> (released March 2020).
+
+<p>
+This module writes UTM GeoTIFFs whose CRS is resolved from an EPSG
+code via <tt>rasterio.crs.CRS.from_epsg()</tt>. That lookup hits the
+<tt>proj.db</tt> SQLite authority database introduced in PROJ 6 and
+fully stabilised in PROJ 7. With an older PROJ the database may be
+absent, incomplete, or bundled inside GDAL under a different path,
+causing <tt>r.import</tt> to fail with a CRS-related error or silently
+create an unnamed / unknown projection in the temporary reprojection
+location, which then produces incorrect or null output after
+<tt>r.proj</tt>.
+
+<p>
+Check your installed version with:
+
+<div class="code"><pre>
+proj --version
+python3 -c "import pyproj; print(pyproj.proj_version_str)"
+</pre></div>
+
+PROJ 9.x (the current generation, available in most distributions
+since 2022) is recommended for best accuracy and datum-shift support.
+Rasterio &gt;= 1.3 and GDAL &gt;= 3.5 are also recommended to ensure
+they are linked against a PROJ 7+ library.
+
+<h2>EXAMPLES</h2>
+
+<h3>Download Sentinel-2 L2A for one month (Planetary Computer)</h3>
+
+<div class="code"><pre>
+g.region n=47.73 s=47.68 e=-2.85 w=-2.93
+r.in.sentinel collection=sentinel-2-l2a bands=B02,B03,B04,B08,B8A,B11,B12,SCL \
+    start=2023-07-01 end=2023-07-31 clouds=20 output=s2_plumergat
+</pre></div>
+
+<h3>List available scenes without downloading</h3>
+
+<div class="code"><pre>
+r.in.sentinel collection=sentinel-2-l2a start=2023-07-01 end=2023-07-31 \
+    output=dummy flags=l
+</pre></div>
+
+<h3>Download with SCL cloud masking</h3>
+
+<div class="code"><pre>
+r.in.sentinel collection=sentinel-2-l2a \
+    bands=B02,B03,B04,B08,B8A,B11,B12,SCL \
+    start=2023-08-01 end=2023-08-31 clouds=50 \
+    output=s2_masked flags=c
+</pre></div>
+
+<h3>Download with spectral cloud index masking (L1C)</h3>
+
+<div class="code"><pre>
+r.in.sentinel collection=sentinel-2-l1c \
+    bands=B02,B04,B08 \
+    start=2023-09-01 end=2023-09-30 \
+    output=s2_l1c flags=s
+</pre></div>
+
+<h3>Use a custom STAC endpoint</h3>
+
+<div class="code"><pre>
+r.in.sentinel collection=sentinel-2-l2a \
+    stac=https://earth-search.aws.element84.com/v1 \
+    bands=B04,B08 start=2023-06-01 end=2023-06-30 output=s2_aws
+</pre></div>
+
+<h3>Download with i.sentinel.mask cloud masking (auto-adds required bands)</h3>
+
+<div class="code"><pre>
+g.region n=47.73 s=47.68 e=-2.85 w=-2.93
+r.in.sentinel collection=sentinel-2-l2a \
+    bands=B02,B04,B08 \
+    start=2023-07-01 end=2023-07-31 clouds=30 \
+    output=s2 flags=m
+# B03, B8A, B11, B12 are added automatically; cloud_mask maps are created
+# per date and cloudy pixels are nulled in all bands.
+</pre></div>
+
+<h3>Import directly into a Space-Time Raster Dataset</h3>
+
+<div class="code"><pre>
+g.region n=47.73 s=47.68 e=-2.85 w=-2.93
+r.in.sentinel collection=sentinel-2-l2a \
+    bands=B02,B03,B04,B08,B8A,B11,B12,SCL \
+    start=2023-07-01 end=2023-07-31 clouds=20 \
+    output=s2 strds=s2_ts flags=c
+# Result: STRDS s2_ts_B02, s2_ts_B04, ..., s2_ts_SCL
+t.rast.list input=s2_ts_B04
+</pre></div>
+
+<h3>Download with metadata JSON written to the standard GRASS location</h3>
+
+<div class="code"><pre>
+r.in.sentinel collection=sentinel-2-l2a bands=B02,B03,B04,B08,SCL \
+    start=2023-07-01 end=2023-07-31 clouds=20 \
+    output=s2_plumergat flags=j
+</pre></div>
+
+<h3>Use Google Earth Engine backend</h3>
+
+<div class="code"><pre>
+r.in.sentinel collection=COPERNICUS/S2_SR_HARMONIZED \
+    bands=B2,B3,B4,B8 \
+    start=2023-07-01 end=2023-07-31 \
+    output=s2_gee flags=g
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="i.group.html">i.group</a>,
+<a href="r.import.html">r.import</a>,
+<a href="r.in.gdal.html">r.in.gdal</a>,
+<a href="g.region.html">g.region</a>,
+<a href="i.sentinel.mask.html">i.sentinel.mask</a>,
+<a href="t.create.html">t.create</a>,
+<a href="t.register.html">t.register</a>,
+<a href="t.rast.series.html">t.rast.series</a>,
+<a href="t.rast.algebra.html">t.rast.algebra</a>
+</em>
+
+<h2>REFERENCES</h2>
+
+<ul>
+<li>Montero, D. et al. (2023). <em>A standardized catalogue of spectral
+indices to advance the use of remote sensing in Earth system
+research.</em> Scientific Data.</li>
+<li><a href="https://github.com/ESDS-Leipzig/cubo">cubo documentation</a></li>
+<li><a href="https://planetarycomputer.microsoft.com/api/stac/v1">Microsoft Planetary Computer STAC</a></li>
+<li><a href="https://sentinels.copernicus.eu/web/sentinel/technical-guides/sentinel-2-msi/level-2a/algorithm-overview">Sentinel-2 SCL classification</a></li>
+</ul>
+
+<h2>AUTHOR</h2>
+
+Yann Chemin

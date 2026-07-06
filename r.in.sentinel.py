@@ -166,6 +166,52 @@ SENTINEL_MASK_BANDS = {
     "swir12": "B12",
 }
 
+# Official Sentinel-2 L2A Scene Classification Layer (SCL) legend
+# (ESA/Sen2Cor). Unlike r.in.landcover's several land-cover products,
+# there's exactly one SCL scheme, so it's applied automatically to any
+# imported SCL band rather than gated behind a flag.
+SCL_COLOR_RULES = """\
+0 0:0:0
+1 255:0:0
+2 47:47:47
+3 100:50:0
+4 0:160:0
+5 255:255:0
+6 0:0:255
+7 128:128:128
+8 192:192:192
+9 255:255:255
+10 100:200:255
+11 255:150:255
+nv 0:0:0
+"""
+
+SCL_CATEGORY_RULES = """\
+0|No data
+1|Saturated or defective
+2|Dark area pixels
+3|Cloud shadows
+4|Vegetation
+5|Not vegetated
+6|Water
+7|Unclassified
+8|Cloud medium probability
+9|Cloud high probability
+10|Thin cirrus
+11|Snow or ice
+"""
+
+
+def apply_scl_style(map_name):
+    """Applies the official SCL color table and class labels."""
+    gs.write_command(
+        "r.colors", map=map_name, rules="-", stdin=SCL_COLOR_RULES, quiet=True
+    )
+    gs.write_command(
+        "r.category", map=map_name, separator="pipe", rules="-",
+        stdin=SCL_CATEGORY_RULES, quiet=True,
+    )
+
 
 def fetch_stac_sun_angles(stac_url, collection, lat, lon, start, end, clouds=None):
     """Return per-date mean solar zenith and azimuth from a STAC metadata search.
@@ -484,8 +530,30 @@ def import_band_to_grass(band_array_2d, map_name, crs_str, transform):
             if hasattr(band_array_2d, "values")
             else band_array_2d
         )
-        # Ensure float32; replace infinities with NaN
-        arr = np.where(np.isfinite(arr), arr, np.nan).astype(np.float32)
+        # cubo/rioxarray return float64 regardless of the source
+        # asset's own dtype -- confirmed empirically: Sentinel-2's DN
+        # reflectance bands and the SCL classification band (both
+        # genuinely integer -- SCL is a discrete class code, DN is a
+        # scaled integer reflectance) come back as float64. Checking
+        # whether the actual finite values are integer-valued (rather
+        # than assuming float means "continuous") writes these as a
+        # proper CELL (integer) raster, matching how GRASS's own
+        # i.sentinel.import stores Sentinel-2 bands, and is what makes
+        # r.category/r.colors on the SCL band meaningful at all
+        # (r.category errors on a genuinely floating-point map).
+        finite_mask = np.isfinite(arr)
+        is_integer_valued = finite_mask.any() and bool(
+            np.all(np.mod(arr[finite_mask], 1) == 0)
+            and np.all(np.abs(arr[finite_mask]) < 65535)
+        )
+        if is_integer_valued:
+            arr = np.where(finite_mask, arr, 0).astype(np.uint16)
+            nodata_val = 0
+            dtype_str = "uint16"
+        else:
+            arr = np.where(finite_mask, arr, np.nan).astype(np.float32)
+            nodata_val = float("nan")
+            dtype_str = "float32"
 
         # CRS: resolve EPSG to full WKT at write time via rasterio/GDAL.
         # GRASS reads the embedded WKT through r.import — EPSG never reaches GRASS.
@@ -500,10 +568,10 @@ def import_band_to_grass(band_array_2d, map_name, crs_str, transform):
             height=height,
             width=width,
             count=1,
-            dtype="float32",
+            dtype=dtype_str,
             crs=crs_obj,
             transform=transform,
-            nodata=float("nan"),
+            nodata=nodata_val,
         ) as dst:
             dst.write(arr, 1)
 
