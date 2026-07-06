@@ -823,14 +823,22 @@ def main():
         acq_time = times_pd[indices[0]]
         timestamp_str = acq_time.strftime("%d %b %Y %H:%M:%S.%f")
 
-        # Mosaic overlapping tiles: mean of valid pixels across tiles
+        # Mosaic overlapping tiles by priority overlay (first tile's
+        # valid pixels win; later tiles only fill in gaps the earlier
+        # ones left as nodata), not a pixel-wise mean: the SCL band is
+        # categorical (class codes, e.g. 4=Vegetation, 6=Water), and
+        # averaging two class codes produces a class that doesn't
+        # exist (mean of 4 and 6 is 5="Not vegetated", a real but
+        # meaningless answer purely by coincidence of the numbering).
         if len(indices) == 1:
             da_day = da.isel(time=indices[0])  # dims: (band, y, x)
         else:
             gs.verbose(
                 f"  {date_str}: mosaicking {len(indices)} overlapping tile(s)…"
             )
-            da_day = da.isel(time=indices).mean(dim="time", skipna=True)
+            da_day = da.isel(time=indices[0])
+            for i in indices[1:]:
+                da_day = da_day.combine_first(da.isel(time=i))
 
         band_maps = []
 
@@ -847,6 +855,9 @@ def main():
                 band_maps.append(map_name)
                 band_map_registry[band_name].append(map_name)
                 imported_maps_total += 1
+
+                if band_name == "SCL":
+                    apply_scl_style(map_name)
 
                 # Set acquisition timestamp on the raster map
                 gs.run_command(
