@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # %Module
-# % description: Downloads and imports Sentinel-2 imagery using the cubo library via Microsoft Planetary Computer or Google Earth Engine.
+# % description: Downloads and imports Sentinel-1 SAR and Sentinel-2 optical imagery using the cubo library via Microsoft Planetary Computer or Google Earth Engine.
 # % keyword: Import
 # % keyword: imagery
 # % keyword: satellite
 # % keyword: Sentinel
+# % keyword: Sentinel-1
+# % keyword: Sentinel-2
+# % keyword: SAR
+# % keyword: radar
 # % keyword: download
 # % keyword: STAC
 # % keyword: Planetary Computer
@@ -18,7 +22,7 @@
 # % required: no
 # % multiple: no
 # % answer: sentinel-2-l2a
-# % description: Name of the Sentinel-2 collection in the STAC catalogue
+# % description: STAC collection or GEE asset ID. Sentinel-2: sentinel-2-l2a (PC) / COPERNICUS/S2_SR_HARMONIZED (GEE). Sentinel-1: sentinel-1-rtc (PC) / COPERNICUS/S1_GRD (GEE).
 # % guisection: Config
 # %end
 
@@ -28,7 +32,7 @@
 # % required: no
 # % multiple: yes
 # % answer: B02,B03,B04,B08,B8A,B11,B12,SCL
-# % description: Sentinel-2 bands to download
+# % description: Bands to download. Sentinel-2 default: B02,B03,B04,B08,B8A,B11,B12,SCL. Sentinel-1 default (auto-detected): vv,vh.
 # % guisection: Config
 # %end
 
@@ -162,6 +166,19 @@ import grass.script as gs
 
 # True-color composite: Sentinel-2 band names for red, green, blue
 RGB_BANDS = ("B04", "B03", "B02")
+
+# Sentinel-1 collection identifiers (Planetary Computer + GEE)
+S1_COLLECTIONS = frozenset({
+    "sentinel-1-rtc",
+    "sentinel-1-grd",
+    "COPERNICUS/S1_GRD",
+})
+
+# Default Sentinel-1 polarization bands (IW / EW dual-pol mode)
+S1_DEFAULT_BANDS = ["vv", "vh"]
+
+# S2 bands default string — used to auto-detect "user didn't touch bands" for S1
+S2_DEFAULT_BANDS_STR = "B02,B03,B04,B08,B8A,B11,B12,SCL"
 
 # Bands required by i.sentinel.mask (mapped to Sentinel-2 band names)
 SENTINEL_MASK_BANDS = {
@@ -612,6 +629,26 @@ def sentinel2_semantic_label(band_name):
     return None
 
 
+def sentinel1_semantic_label(band_name):
+    """Return the GRASS semantic label for a Sentinel-1 band name.
+
+    E.g. 'vv' -> 'S1_VV', 'vh' -> 'S1_VH', 'angle' -> 'S1_angle'.
+    Returns None for unrecognised names.
+    """
+    mapping = {
+        "vv": "S1_VV",
+        "vh": "S1_VH",
+        "hh": "S1_HH",
+        "hv": "S1_HV",
+        "angle": "S1_angle",
+        "VV": "S1_VV",
+        "VH": "S1_VH",
+        "HH": "S1_HH",
+        "HV": "S1_HV",
+    }
+    return mapping.get(band_name)
+
+
 def write_band_metadata(map_name, metadata_dict, metadata_dir=None):
     """Write per-band metadata as description.json.
 
@@ -670,16 +707,57 @@ def main():
 
     clouds = int(clouds_raw) if clouds_raw else None
 
-    # GEE uses a different default collection name
-    if use_gee and collection == "sentinel-2-l2a":
+    # --- Parse band list ---
+    bands = [b.strip() for b in bands_raw.split(",") if b.strip()]
+
+    # --- Detect Sentinel-1 vs Sentinel-2 ---
+    is_s1 = (
+        collection in S1_COLLECTIONS
+        or collection.lower().startswith("sentinel-1")
+    )
+
+    if is_s1:
+        # Auto-swap S2 default bands → S1 defaults when user didn't change them
+        bands_csv = ",".join(bands)
+        if bands_csv == S2_DEFAULT_BANDS_STR:
+            gs.message(
+                "Sentinel-1 collection detected; "
+                f"switching default bands to: {', '.join(S1_DEFAULT_BANDS)}"
+            )
+            bands = list(S1_DEFAULT_BANDS)
+        # Suppress S2-only processing flags with informative warnings
+        if do_scl_mask:
+            gs.warning("SCL cloud masking (-c) is not applicable to Sentinel-1 SAR; ignored.")
+            do_scl_mask = False
+        if do_spectral_mask:
+            gs.warning("Spectral cloud masking (-s) is not applicable to Sentinel-1 SAR; ignored.")
+            do_spectral_mask = False
+        if do_sentinel_mask:
+            gs.warning("i.sentinel.mask (-m) is not applicable to Sentinel-1 SAR; ignored.")
+            do_sentinel_mask = False
+        if do_rgb:
+            gs.warning("RGB composite (-r) is not applicable to Sentinel-1 SAR; ignored.")
+            do_rgb = False
+        if clouds is not None:
+            gs.warning(
+                "Cloud cover filter has no effect for Sentinel-1 SAR "
+                "(SAR is cloud-independent); ignored."
+            )
+            clouds = None
+
+    # --- GEE collection hints ---
+    if use_gee and not is_s1 and collection == "sentinel-2-l2a":
         gs.message(
             "Note: for GEE the common Sentinel-2 SR collection is "
             "'COPERNICUS/S2_SR_HARMONIZED'. "
             "Override with the 'collection' option if needed."
         )
-
-    # --- Parse band list ---
-    bands = [b.strip() for b in bands_raw.split(",") if b.strip()]
+    if use_gee and is_s1 and collection == "sentinel-1-rtc":
+        gs.message(
+            "Note: for GEE the Sentinel-1 collection is "
+            "'COPERNICUS/S1_GRD'. "
+            "Override with the 'collection' option if needed."
+        )
 
     # Ensure SCL is included when SCL cloud masking is requested
     if do_scl_mask and "SCL" not in bands:
@@ -874,6 +952,8 @@ def main():
 
                 if band_name == "SCL":
                     apply_scl_style(map_name)
+                elif is_s1:
+                    gs.run_command("r.colors", map=map_name, color="grey", quiet=True)
 
                 # Set acquisition timestamp on the raster map
                 gs.run_command(
@@ -891,7 +971,11 @@ def main():
                         f"n_tiles={len(indices)}"
                     ),
                 }
-                sem_label = sentinel2_semantic_label(band_name)
+                sem_label = (
+                    sentinel1_semantic_label(band_name)
+                    if is_s1
+                    else sentinel2_semantic_label(band_name)
+                )
                 if sem_label:
                     support_args["semantic_label"] = sem_label
                 gs.run_command("r.support", quiet=True, **support_args)
@@ -1057,6 +1141,7 @@ def main():
             tgis.init()
         except Exception as e:
             gs.warning(f"Failed to initialise temporal framework: {e}")
+        sensor_name = "Sentinel-1" if is_s1 else "Sentinel-2"
         strds_created = []
         for band_name, map_list in band_map_registry.items():
             if not map_list:
@@ -1068,7 +1153,7 @@ def main():
                     type="strds",
                     temporaltype="absolute",
                     output=strds_name,
-                    title=f"Sentinel-2 {collection} — band {band_name}",
+                    title=f"{sensor_name} {collection} — band {band_name}",
                     description=(
                         f"Imported by r.in.sentinel from {collection}, "
                         f"{start} to {end}, band {band_name}"
