@@ -163,11 +163,6 @@ import grass.script as gs
 # True-color composite: Sentinel-2 band names for red, green, blue
 RGB_BANDS = ("B04", "B03", "B02")
 
-# Linear stretch ceiling for S2 L2A reflectance (DN units, factor 10000).
-# Typical bright-but-not-saturated surface pixels are <3000; clouds/snow
-# exceed this and will clip to white, which is the desired behaviour.
-S2_RGB_STRETCH_MAX = 3000
-
 # Bands required by i.sentinel.mask (mapped to Sentinel-2 band names)
 SENTINEL_MASK_BANDS = {
     "blue": "B02",
@@ -1022,18 +1017,8 @@ def main():
             if all(m in band_maps for m in (r_map, g_map, b_map)):
                 rgb_name = f"{output_prefix}_{date_str}_RGB"
                 try:
-                    # Linear 0–S2_RGB_STRETCH_MAX stretch on each channel so
-                    # typical surface reflectances (vegetation, soil, water) fall
-                    # in the visible range; clouds/snow clip to white.
-                    stretch_rules = f"0 0:0:0\n{S2_RGB_STRETCH_MAX} 255:255:255\n"
-                    for bmap in (r_map, g_map, b_map):
-                        gs.write_command(
-                            "r.colors", map=bmap, rules="-",
-                            stdin=stretch_rules, quiet=True,
-                        )
                     gs.run_command(
                         "r.composite",
-                        flags="c",
                         red=r_map, green=g_map, blue=b_map,
                         output=rgb_name,
                         overwrite=True, quiet=True,
@@ -1048,10 +1033,7 @@ def main():
                         "r.support", map=rgb_name,
                         source1="GEE" if use_gee else stac_url,
                         source2=collection,
-                        history=(
-                            f"r.composite B04/B03/B02 stretch=0:{S2_RGB_STRETCH_MAX} "
-                            f"date={date_str}"
-                        ),
+                        history=f"r.composite B04/B03/B02 date={date_str}",
                         quiet=True,
                     )
                 except Exception as e:
