@@ -124,6 +124,11 @@
 # % description: Print region info and exit
 # %end
 
+# %flag
+# % key: r
+# % description: Create true-color RGB composite with r.composite after import (auto-adds B02, B03, B04 if not listed)
+# %end
+
 # %option
 # % key: metadata
 # % type: string
@@ -154,6 +159,14 @@ import sys
 import tempfile
 
 import grass.script as gs
+
+# True-color composite: Sentinel-2 band names for red, green, blue
+RGB_BANDS = ("B04", "B03", "B02")
+
+# Linear stretch ceiling for S2 L2A reflectance (DN units, factor 10000).
+# Typical bright-but-not-saturated surface pixels are <3000; clouds/snow
+# exceed this and will clip to white, which is the desired behaviour.
+S2_RGB_STRETCH_MAX = 3000
 
 # Bands required by i.sentinel.mask (mapped to Sentinel-2 band names)
 SENTINEL_MASK_BANDS = {
@@ -651,6 +664,7 @@ def main():
     do_scl_mask = flags["c"]
     do_spectral_mask = flags["s"]
     do_sentinel_mask = flags["m"]
+    do_rgb = flags["r"]
     list_only = flags["l"]
     print_region = flags["p"]
     write_json = flags["j"]
@@ -676,6 +690,13 @@ def main():
     if do_scl_mask and "SCL" not in bands:
         gs.message("Adding SCL band to download list for cloud masking.")
         bands.append("SCL")
+
+    # Ensure B02/B03/B04 are present when RGB composite is requested
+    if do_rgb:
+        added_rgb = [b for b in RGB_BANDS if b not in bands]
+        if added_rgb:
+            gs.message(f"Adding bands required for RGB composite: {', '.join(added_rgb)}")
+            bands.extend(added_rgb)
 
     # Ensure all i.sentinel.mask bands are present when -m is requested
     if do_sentinel_mask:
@@ -992,6 +1013,54 @@ def main():
                 )
             except Exception as e:
                 gs.warning(f"Failed to create group '{group_name}': {e}")
+
+        # --- RGB true-color composite ---
+        if do_rgb and band_maps:
+            r_map = f"{output_prefix}_{date_str}_B04"
+            g_map = f"{output_prefix}_{date_str}_B03"
+            b_map = f"{output_prefix}_{date_str}_B02"
+            if all(m in band_maps for m in (r_map, g_map, b_map)):
+                rgb_name = f"{output_prefix}_{date_str}_RGB"
+                try:
+                    # Linear 0–S2_RGB_STRETCH_MAX stretch on each channel so
+                    # typical surface reflectances (vegetation, soil, water) fall
+                    # in the visible range; clouds/snow clip to white.
+                    stretch_rules = f"0 0:0:0\n{S2_RGB_STRETCH_MAX} 255:255:255\n"
+                    for bmap in (r_map, g_map, b_map):
+                        gs.write_command(
+                            "r.colors", map=bmap, rules="-",
+                            stdin=stretch_rules, quiet=True,
+                        )
+                    gs.run_command(
+                        "r.composite",
+                        flags="c",
+                        red=r_map, green=g_map, blue=b_map,
+                        output=rgb_name,
+                        overwrite=True, quiet=True,
+                    )
+                    gs.message(f"  {date_str}: RGB composite → {rgb_name}")
+                    band_map_registry.setdefault("RGB", []).append(rgb_name)
+                    imported_maps_total += 1
+                    gs.run_command(
+                        "r.timestamp", map=rgb_name, date=timestamp_str, quiet=True
+                    )
+                    gs.run_command(
+                        "r.support", map=rgb_name,
+                        source1="GEE" if use_gee else stac_url,
+                        source2=collection,
+                        history=(
+                            f"r.composite B04/B03/B02 stretch=0:{S2_RGB_STRETCH_MAX} "
+                            f"date={date_str}"
+                        ),
+                        quiet=True,
+                    )
+                except Exception as e:
+                    gs.warning(f"{date_str}: RGB composite failed: {e}")
+            else:
+                gs.warning(
+                    f"{date_str}: skipping RGB composite — "
+                    "one or more of B02/B03/B04 not imported"
+                )
 
     gs.message(
         f"Done. Imported {imported_maps_total} raster map(s) "
