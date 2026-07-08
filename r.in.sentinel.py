@@ -133,6 +133,11 @@
 # % description: Create true-color RGB composite with r.composite after import (auto-adds B02, B03, B04 if not listed)
 # %end
 
+# %flag
+# % key: d
+# % description: Convert Sentinel-1 backscatter (vv/vh/hh/hv) from linear power to dB (10*log10); no effect on Sentinel-2 or the angle band
+# %end
+
 # %option
 # % key: metadata
 # % type: string
@@ -176,6 +181,10 @@ S1_COLLECTIONS = frozenset({
 
 # Default Sentinel-1 polarization bands (IW / EW dual-pol mode)
 S1_DEFAULT_BANDS = ["vv", "vh"]
+
+# Sentinel-1 power bands eligible for linear-to-dB conversion (-d flag).
+# "angle" (incidence angle, degrees) is not a power quantity and is excluded.
+S1_POWER_BANDS = {"vv", "vh", "hh", "hv"}
 
 # S2 bands default string — used to auto-detect "user didn't touch bands" for S1
 S2_DEFAULT_BANDS_STR = "B02,B03,B04,B08,B8A,B11,B12,SCL"
@@ -697,6 +706,7 @@ def main():
     do_spectral_mask = flags["s"]
     do_sentinel_mask = flags["m"]
     do_rgb = flags["r"]
+    do_db = flags["d"]
     list_only = flags["l"]
     print_region = flags["p"]
     write_json = flags["j"]
@@ -744,6 +754,9 @@ def main():
                 "(SAR is cloud-independent); ignored."
             )
             clouds = None
+    elif do_db:
+        gs.warning("dB conversion (-d) is not applicable to Sentinel-2 optical bands; ignored.")
+        do_db = False
 
     # --- GEE collection hints ---
     if use_gee and not is_s1 and collection == "sentinel-2-l2a":
@@ -955,6 +968,15 @@ def main():
                 band_map_registry[band_name].append(map_name)
                 imported_maps_total += 1
 
+                if do_db and band_name.lower() in S1_POWER_BANDS:
+                    # sentinel-1-rtc (Planetary Computer) and COPERNICUS/S1_GRD
+                    # (GEE) are linear power; many downstream tools (e.g.
+                    # Water Cloud Model based ones) expect dB.
+                    gs.mapcalc(
+                        f"{map_name} = if({map_name} > 0, 10.0 * log({map_name}, 10.0), null())",
+                        overwrite=True, quiet=True,
+                    )
+
                 if band_name == "SCL":
                     apply_scl_style(map_name)
                 elif is_s1:
@@ -974,8 +996,11 @@ def main():
                         f"band={band_name} date={date_str} "
                         f"epsg={epsg} resolution={resolution}m "
                         f"n_tiles={len(indices)}"
+                        + (" converted to dB (10*log10)" if do_db and band_name.lower() in S1_POWER_BANDS else "")
                     ),
                 }
+                if do_db and band_name.lower() in S1_POWER_BANDS:
+                    support_args["units"] = "dB"
                 sem_label = (
                     sentinel1_semantic_label(band_name)
                     if is_s1
@@ -1000,6 +1025,7 @@ def main():
                         "scl_masked": do_scl_mask,
                         "spectral_masked": do_spectral_mask,
                         "sentinel_masked": do_sentinel_mask,
+                        "db_converted": bool(do_db and band_name.lower() in S1_POWER_BANDS),
                         "n_tiles_mosaicked": len(indices),
                         "central_lat": lat,
                         "central_lon": lon,
