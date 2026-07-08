@@ -914,8 +914,13 @@ def main():
         indices = [i for i, d in enumerate(date_strs) if d == date_str]
 
         # Use the timestamp of the first tile for r.timestamp
+        # Note: whole seconds only - GRASS's r.timestamp/t.register datetime
+        # round-trip corrupts the seconds field (drops its zero-pad) when
+        # given a fractional-seconds string, which then breaks t.register
+        # with "Empty datetime object". Sub-second acquisition precision
+        # isn't meaningful for daily satellite scenes anyway.
         acq_time = times_pd[indices[0]]
-        timestamp_str = acq_time.strftime("%d %b %Y %H:%M:%S.%f")
+        timestamp_str = acq_time.strftime("%d %b %Y %H:%M:%S")
 
         # Mosaic overlapping tiles by priority overlay (first tile's
         # valid pixels win; later tiles only fill in gaps the earlier
