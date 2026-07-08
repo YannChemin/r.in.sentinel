@@ -30,6 +30,21 @@ Use the **g** flag and set **collection** to the GEE asset ID, e.g.
 `COPERNICUS/S2_SR_HARMONIZED`. GEE credentials must be configured
 beforehand (`earthengine authenticate`).
 
+### Sentinel-1 SAR units
+
+Sentinel-1 backscatter (`vv`, `vh`, `hh`, `hv`) is imported as **linear
+power** (gamma0), matching what both Planetary Computer's
+`sentinel-1-rtc` and GEE's `COPERNICUS/S1_GRD` return. Many downstream
+tools expect **dB** instead (10 × log10 of linear power) - pass the
+**d** flag to convert those bands at import time. The **angle**
+(incidence angle, degrees) band, if requested, is left untouched since
+it is not a power quantity.
+
+```
+r.in.sentinel collection=sentinel-1-rtc bands=vv,vh \
+  start=2024-01-01 end=2024-07-01 output=s1 -d strds=s1
+```
+
 ## NOTES
 
 ### Cloud removal
