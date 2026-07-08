@@ -921,6 +921,8 @@ def main():
         # isn't meaningful for daily satellite scenes anyway.
         acq_time = times_pd[indices[0]]
         timestamp_str = acq_time.strftime("%d %b %Y %H:%M:%S")
+        with open("/tmp/rinsentinel_debug.log", "a") as _dbgf:
+            _dbgf.write(f"DEBUG {date_str}: acq_time={acq_time!r} timestamp_str={timestamp_str!r}\n")
 
         # Mosaic overlapping tiles by priority overlay (first tile's
         # valid pixels win; later tiles only fill in gaps the earlier
