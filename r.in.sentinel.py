@@ -166,6 +166,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import grass.script as gs
 
@@ -447,9 +448,27 @@ def download_cube(
             **kwargs,
         )
 
-    # Realize dask arrays
+    # Realize dask arrays. A single transient blob-storage read failure
+    # (STAC assets are read directly from Azure/GCS, no retry built into
+    # cubo/stackstac) otherwise aborts the entire multi-year, multi-band
+    # request - retry the whole compute() a few times with backoff before
+    # giving up, since re-computing the same (already-built) dask graph
+    # is cheap relative to losing all progress.
     gs.verbose("Computing data cube (downloading data)…")
-    da = da.compute()
+    max_retries = 4
+    for attempt in range(1, max_retries + 1):
+        try:
+            da = da.compute()
+            break
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            wait_s = 10 * attempt
+            gs.warning(
+                f"Data cube download failed (attempt {attempt}/{max_retries}): {e}. "
+                f"Retrying in {wait_s}s…"
+            )
+            time.sleep(wait_s)
     return da
 
 
