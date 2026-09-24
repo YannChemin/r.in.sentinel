@@ -113,6 +113,7 @@ Each JSON file records:
 | `cloud_cover_max` | Maximum cloud cover filter applied |
 | `scl_masked` | Whether SCL cloud masking was applied |
 | `spectral_masked` | Whether spectral CSI masking was applied |
+| `boa_offset_removed` | Whether the Sentinel-2 L2A offset was removed (**o** flag) |
 | `n_tiles_mosaicked` | Number of overlapping tiles merged |
 | `central_lat` / `central_lon` | Region centre in WGS84 |
 
@@ -165,7 +166,39 @@ date with a warning.
 ### Listing scenes
 
 With the **-l** flag the module prints one date per line to stdout and
-exits without importing anything.
+exits without importing anything. With the STAC backend the listing is a
+metadata-only search over the same box the download would cover (the
+**clouds** filter applies); no imagery is read. With **g** (GEE) the
+cube is still built to list its dates.
+
+### Sentinel-2 L2A radiometric offset
+
+Since processing baseline 04.00 (products from 25 January 2022),
+Sentinel-2 L2A digital numbers include an offset
+(`BOA_ADD_OFFSET = -1000`): surface reflectance is
+`(DN - 1000) / 10000`. Planetary Computer serves the DNs unchanged, so
+without correction normalised indices such as NDVI are biased and older
+and newer products are not comparable. The **o** flag subtracts 1000 from
+every reflectance band of the affected items (read from the
+`s2:processing_baseline` item property, or from the acquisition date if the
+property is missing) and clips at 0; the **SCL** band is never modified.
+The correction is recorded in the map history and, with **j** or
+**metadata**, as `boa_offset_removed` in `description.json`. It has no
+effect on Sentinel-1 or on GEE's already harmonised
+`COPERNICUS/S2_SR_HARMONIZED`.
+
+```sh
+r.in.sentinel -c -o start=2025-01-01 end=2025-12-31 output=s2 strds=s2
+```
+
+### Mosaicking of overlapping acquisitions
+
+Acquisitions of the same date are mosaicked (first valid pixel wins) only
+when they belong to the same satellite pass (within one hour of the first
+acquisition of the day). Other passes of that day, e.g. the ascending
+Sentinel-1 pass on a day that also has a descending one, are not used to
+fill gaps, so each imported map has a single viewing geometry and its
+timestamp matches its data.
 
 ## REQUIREMENTS
 

@@ -104,6 +104,7 @@ Each JSON file records:
 <tr><td><tt>cloud_cover_max</tt></td><td>Maximum cloud cover filter applied</td></tr>
 <tr><td><tt>scl_masked</tt></td><td>Whether SCL cloud masking was applied</td></tr>
 <tr><td><tt>spectral_masked</tt></td><td>Whether spectral CSI masking was applied</td></tr>
+<tr><td><tt>boa_offset_removed</tt></td><td>Whether the Sentinel-2 L2A offset was removed (<b>o</b> flag)</td></tr>
 <tr><td><tt>n_tiles_mosaicked</tt></td><td>Number of overlapping tiles merged</td></tr>
 <tr><td><tt>central_lat</tt> / <tt>central_lon</tt></td><td>Region centre in WGS84</td></tr>
 </table>
@@ -169,7 +170,40 @@ that date with a warning.
 <h3>Listing scenes</h3>
 
 With the <b>-l</b> flag the module prints one date per line to stdout
-and exits without importing anything.
+and exits without importing anything. With the STAC backend the listing is
+a metadata-only search over the same box the download would cover (the
+<b>clouds</b> filter applies); no imagery is read. With <b>g</b> (GEE) the
+cube is still built to list its dates.
+
+<h3>Sentinel-2 L2A radiometric offset</h3>
+
+Since processing baseline 04.00 (products from 25 January 2022),
+Sentinel-2 L2A digital numbers include an offset
+(<code>BOA_ADD_OFFSET = -1000</code>): surface reflectance is
+<code>(DN - 1000) / 10000</code>. Planetary Computer serves the DNs
+unchanged, so without correction normalised indices such as NDVI are biased
+and older and newer products are not comparable. The <b>o</b> flag
+subtracts 1000 from every reflectance band of the affected items (read from
+the <code>s2:processing_baseline</code> item property, or from the
+acquisition date if the property is missing) and clips at 0; the
+<b>SCL</b> band is never modified. The correction is recorded in the map
+history and, with <b>j</b> or <b>metadata</b>, as
+<code>boa_offset_removed</code> in <code>description.json</code>. It has no
+effect on Sentinel-1 or on GEE's already harmonised
+<code>COPERNICUS/S2_SR_HARMONIZED</code>.
+
+<div class="code"><pre>
+r.in.sentinel -c -o start=2025-01-01 end=2025-12-31 output=s2 strds=s2
+</pre></div>
+
+<h3>Mosaicking of overlapping acquisitions</h3>
+
+Acquisitions of the same date are mosaicked (first valid pixel wins) only
+when they belong to the same satellite pass (within one hour of the first
+acquisition of the day). Other passes of that day, e.g. the ascending
+Sentinel-1 pass on a day that also has a descending one, are not used to
+fill gaps, so each imported map has a single viewing geometry and its
+timestamp matches its data.
 
 <h2>REQUIREMENTS</h2>
 

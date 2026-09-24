@@ -138,6 +138,11 @@
 # % description: Convert Sentinel-1 backscatter (vv/vh/hh/hv) from linear power to dB (10*log10); no effect on Sentinel-2 or the angle band
 # %end
 
+# %flag
+# % key: o
+# % description: Remove the Sentinel-2 L2A radiometric offset (DN - 1000 for processing baseline >= 04.00), harmonising with older products; no effect on SCL, Sentinel-1 or GEE
+# %end
+
 # %option
 # % key: metadata
 # % type: string
@@ -186,6 +191,20 @@ S1_DEFAULT_BANDS = ["vv", "vh"]
 # Sentinel-1 power bands eligible for linear-to-dB conversion (-d flag).
 # "angle" (incidence angle, degrees) is not a power quantity and is excluded.
 S1_POWER_BANDS = {"vv", "vh", "hh", "hv"}
+
+# Sentinel-2 L2A products of processing baseline >= 04.00 (ESA, from
+# 25 January 2022) carry BOA_ADD_OFFSET = -1000: reflectance =
+# (DN - 1000) / 10000. Planetary Computer serves the DNs unchanged, so older
+# and newer products are not comparable unless the offset is removed (-o).
+# GEE's COPERNICUS/S2_SR_HARMONIZED is already harmonised.
+S2_BOA_OFFSET = 1000
+S2_OFFSET_BASELINE = 4.0
+S2_OFFSET_START = "2022-01-25"
+
+# Tiles of one date are mosaicked only within the same satellite pass:
+# ascending and descending Sentinel-1 passes (or two Sentinel-2 satellites)
+# can fall on the same day with different viewing geometry.
+SAME_PASS_SECONDS = 3600
 
 # S2 bands default string — used to auto-detect "user didn't touch bands" for S1
 S2_DEFAULT_BANDS_STR = "B02,B03,B04,B08,B8A,B11,B12,SCL"
@@ -418,55 +437,66 @@ def download_cube(
     if clouds is not None:
         kwargs["query"] = {"eo:cloud_cover": {"lt": clouds}}
 
-    if use_gee:
-        da = cubo.create(
-            lat=lat,
-            lon=lon,
-            collection=collection,
-            start_date=start,
-            end_date=end,
-            bands=bands,
-            edge_size=edge_size,
-            units="px",
-            resolution=float(resolution),
-            gee=True,
-            **kwargs,
-        )
-    else:
-        da = cubo.create(
-            lat=lat,
-            lon=lon,
-            collection=collection,
-            start_date=start,
-            end_date=end,
-            bands=bands,
-            edge_size=edge_size,
-            units="px",
-            resolution=float(resolution),
-            stac=stac_url,
-            gee=False,
-            **kwargs,
-        )
-
-    # Realize dask arrays. A single transient blob-storage read failure
-    # (STAC assets are read directly from Azure/GCS, no retry built into
-    # cubo/stackstac) otherwise aborts the entire multi-year, multi-band
-    # request - retry the whole compute() a few times with backoff before
-    # giving up, since re-computing the same (already-built) dask graph
-    # is cheap relative to losing all progress.
+    # cubo.create() signs each STAC asset's blob-storage URL ONCE, at
+    # graph-build time (not lazily per-read) - so a retry that only
+    # re-calls .compute() on the same dask graph reuses the same signed
+    # URLs, which is useless if the failure was an auth/signature issue
+    # (confirmed: repeated 403s across different files all carried the
+    # identical sig= parameter). A single transient blob-storage read
+    # failure otherwise aborts the entire multi-year, multi-band
+    # request - retry the WHOLE create()+compute() sequence a few times
+    # with backoff, so each attempt gets freshly-signed URLs, before
+    # giving up.
     gs.verbose("Computing data cube (downloading data)…")
     max_retries = 4
     for attempt in range(1, max_retries + 1):
         try:
-            da = da.compute()
+            if use_gee:
+                da = cubo.create(
+                    lat=lat,
+                    lon=lon,
+                    collection=collection,
+                    start_date=start,
+                    end_date=end,
+                    bands=bands,
+                    edge_size=edge_size,
+                    units="px",
+                    resolution=float(resolution),
+                    gee=True,
+                    **kwargs,
+                )
+            else:
+                da = cubo.create(
+                    lat=lat,
+                    lon=lon,
+                    collection=collection,
+                    start_date=start,
+                    end_date=end,
+                    bands=bands,
+                    edge_size=edge_size,
+                    units="px",
+                    resolution=float(resolution),
+                    stac=stac_url,
+                    gee=False,
+                    **kwargs,
+                )
+            # Default dask threaded scheduler reads all chunks (1024x1024
+            # px each) fully in parallel across every CPU thread, which
+            # can overwhelm/destabilize concurrent range-GET connections
+            # against a single blob-storage account, producing sporadic
+            # per-window RasterioIOErrors that otherwise look like
+            # generic transient network flakiness. Capping worker count
+            # keeps enough parallelism to be fast while avoiding the
+            # connection storm.
+            da = da.compute(num_workers=4)
             break
         except Exception as e:
             if attempt == max_retries:
                 raise
-            wait_s = 10 * attempt
+            wait_s = 15 * attempt
             gs.warning(
                 f"Data cube download failed (attempt {attempt}/{max_retries}): {e}. "
-                f"Retrying in {wait_s}s…"
+                f"Rebuilding the request and retrying in {wait_s}s…"
             )
             time.sleep(wait_s)
     return da
@@ -698,6 +728,70 @@ def write_band_metadata(map_name, metadata_dict, metadata_dir=None):
         json.dump(metadata_dict, fh, indent=2)
 
 
+def remove_boa_offset(da):
+    """Subtract the L2A BOA offset from reflectance bands of affected dates.
+
+    Uses the per-item ``s2:processing_baseline`` coordinate when present
+    (stackstac exposes STAC item properties as coordinates), otherwise the
+    ESA switch date. SCL (class codes) is never modified. Values are
+    clipped at 0 so no negative DN is produced; nodata (NaN) stays NaN.
+
+    Returns
+    -------
+    tuple
+        (xarray.DataArray, number of corrected time slices)
+    """
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+
+    if "s2:processing_baseline" in da.coords:
+        baselines = np.atleast_1d(da.coords["s2:processing_baseline"].values)
+        affected = np.array(
+            [float(str(b)) >= S2_OFFSET_BASELINE for b in baselines]
+        )
+    else:
+        affected = pd.DatetimeIndex(da.coords["time"].values) >= pd.Timestamp(
+            S2_OFFSET_START
+        )
+    refl = [str(b) for b in da.coords["band"].values if str(b) != "SCL"]
+    if not refl or not affected.any():
+        return da, 0
+    mask = xr.DataArray(affected, dims="time", coords={"time": da.coords["time"]})
+    sel = da.sel(band=refl)
+    da = da.astype("float32")
+    da.loc[dict(band=refl)] = xr.where(mask, (sel - S2_BOA_OFFSET).clip(min=0), sel)
+    return da, int(affected.sum())
+
+
+def list_stac_dates(stac_url, collection, lat, lon, edge_size_m, start, end, clouds=None):
+    """List acquisition dates from STAC item metadata, without any download.
+
+    The search area is the same box the cube would cover (centre +- half the
+    edge size), so the listing matches what a download would return.
+    """
+    import math
+
+    import pystac_client
+
+    half_lat = edge_size_m / 2.0 / 111320.0
+    half_lon = half_lat / max(math.cos(math.radians(lat)), 1e-6)
+    client = pystac_client.Client.open(stac_url)
+    search = client.search(
+        collections=[collection],
+        datetime=f"{start}/{end}",
+        bbox=[lon - half_lon, lat - half_lat, lon + half_lon, lat + half_lat],
+    )
+    dates = set()
+    for item in search.items():
+        cc = item.properties.get("eo:cloud_cover")
+        if clouds is not None and cc is not None and cc >= clouds:
+            continue
+        if item.datetime is not None:
+            dates.add(item.datetime.strftime("%Y-%m-%d"))
+    return sorted(dates)
+
+
 def main():
     """Main function."""
     try:
@@ -727,6 +821,8 @@ def main():
     do_rgb = flags["r"]
     do_db = flags["d"]
     list_only = flags["l"]
+    remove_offset = flags["o"]
+    offset_applied = False
     print_region = flags["p"]
     write_json = flags["j"]
     metadata_dir = options["metadata"] if options["metadata"] else None
@@ -834,6 +930,19 @@ def main():
         )
         return 0
 
+    # --- List-only mode (STAC): metadata search, no download ---
+    if list_only and not use_gee:
+        try:
+            dates = list_stac_dates(
+                stac_url, collection, lat, lon, edge_size_m, start, end, clouds
+            )
+        except Exception as e:
+            gs.fatal(f"STAC search failed: {e}")
+        gs.message(f"Available dates ({len(dates)}):")
+        for d in dates:
+            print(d)
+        return 0
+
     # --- Download ---
     gs.message(
         f"Downloading {collection} data from "
@@ -880,6 +989,18 @@ def main():
         for d in unique_dates_list:
             print(d)
         return 0
+
+    # --- Radiometric offset (Sentinel-2 L2A, baseline >= 04.00) ---
+    if remove_offset:
+        if is_s1 or use_gee:
+            gs.warning("-o only applies to Sentinel-2 L2A from STAC; ignored.")
+        else:
+            da, n_fixed = remove_boa_offset(da)
+            offset_applied = n_fixed > 0
+            gs.message(
+                f"Removed BOA offset ({S2_BOA_OFFSET} DN) from {n_fixed} "
+                f"of {da.sizes['time']} time slice(s)."
+            )
 
     # --- Cloud masking ---
     if do_scl_mask:
@@ -944,6 +1065,18 @@ def main():
 
     for date_str in unique_dates:
         indices = [i for i, d in enumerate(date_strs) if d == date_str]
+        # Keep only tiles of the first pass of the day (see SAME_PASS_SECONDS).
+        first_pass = times_pd[indices[0]]
+        same_pass = [
+            i for i in indices
+            if abs((times_pd[i] - first_pass).total_seconds()) <= SAME_PASS_SECONDS
+        ]
+        if len(same_pass) < len(indices):
+            gs.verbose(
+                f"  {date_str}: {len(indices) - len(same_pass)} acquisition(s) "
+                "from another pass that day not mosaicked"
+            )
+        indices = same_pass
 
         # Use the timestamp of the first tile for r.timestamp
         # Note: whole seconds only - GRASS's r.timestamp/t.register datetime
@@ -1016,6 +1149,7 @@ def main():
                         f"epsg={epsg} resolution={resolution}m "
                         f"n_tiles={len(indices)}"
                         + (" converted to dB (10*log10)" if do_db and band_name.lower() in S1_POWER_BANDS else "")
+                        + (f" BOA offset {S2_BOA_OFFSET} removed if baseline>=04.00" if offset_applied and band_name != "SCL" else "")
                     ),
                 }
                 if do_db and band_name.lower() in S1_POWER_BANDS:
@@ -1045,6 +1179,7 @@ def main():
                         "spectral_masked": do_spectral_mask,
                         "sentinel_masked": do_sentinel_mask,
                         "db_converted": bool(do_db and band_name.lower() in S1_POWER_BANDS),
+                        "boa_offset_removed": bool(offset_applied and band_name != "SCL"),
                         "n_tiles_mosaicked": len(indices),
                         "central_lat": lat,
                         "central_lon": lon,
